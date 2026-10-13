@@ -88,6 +88,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
     blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
+    arena_memory_type_bits = reqs.memoryTypeBits;
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
@@ -947,12 +948,47 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 }
 
 std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
-    const auto allocate = [this](u64 allocation_size) {
+    const auto try_allocate = [this](u64 allocation_size,
+                                     u32 type_index) -> std::optional<vk::DeviceMemory> {
         const vk::MemoryAllocateInfo alloc_info = {
             .allocationSize = allocation_size,
-            .memoryTypeIndex = arena_memory_type_index,
+            .memoryTypeIndex = type_index,
         };
-        return Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        vk::DeviceMemory memory{};
+        const auto result = instance.GetDevice().allocateMemory(&alloc_info, nullptr, &memory);
+        if (result == vk::Result::eSuccess) {
+            return memory;
+        }
+        ASSERT_MSG(result == vk::Result::eErrorOutOfDeviceMemory ||
+                       result == vk::Result::eErrorOutOfHostMemory,
+                   "Failed allocating residency memory with error {}", vk::to_string(result));
+        return std::nullopt;
+    };
+    const auto allocate = [this, &try_allocate](u64 allocation_size) -> vk::DeviceMemory {
+        if (const auto memory = try_allocate(allocation_size, arena_memory_type_index)) {
+            return *memory;
+        }
+        // Textures the game no longer uses may be holding the memory, free them first.
+        if (texture_cache.ReleaseMemoryUnderPressure()) {
+            if (const auto memory = try_allocate(allocation_size, arena_memory_type_index)) {
+                return *memory;
+            }
+        }
+        // Video memory is full. Past it the driver can't move this memory out, so it goes to
+        // the other memory types instead of ending the game.
+        LOG_WARNING(Render_Vulkan,
+                    "Allocating {} bytes of residency memory failed, trying other memory types",
+                    allocation_size);
+        const auto& properties = instance.GetMemoryProperties();
+        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+            if (i == arena_memory_type_index || ((arena_memory_type_bits >> i) & 1) == 0) {
+                continue;
+            }
+            if (const auto memory = try_allocate(allocation_size, i)) {
+                return *memory;
+            }
+        }
+        UNREACHABLE_MSG("Out of memory allocating {} bytes of residency memory", allocation_size);
     };
     // Ranges keep coming as the game streams data in. Carving them out of large chunks keeps the
     // driver from allocating memory each time, which is slow and limited to a few thousand

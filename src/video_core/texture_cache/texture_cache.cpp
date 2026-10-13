@@ -1117,6 +1117,42 @@ void TextureCache::RunGarbageCollector() {
     ++gc_tick;
 }
 
+bool TextureCache::ReleaseMemoryUnderPressure() {
+    // Images used in the last couple of submissions may still be bound, keep those.
+    constexpr u64 MIN_IDLE_TICKS = 2;
+    constexpr u64 MIN_FREED_BYTES = 256_MB;
+    if (gc_tick <= MIN_IDLE_TICKS) {
+        return false;
+    }
+    u64 freed_bytes = 0;
+    image_lru_cache.ForEachItemBelow(gc_tick - MIN_IDLE_TICKS, [&](Image& image) {
+        if (freed_bytes >= MIN_FREED_BYTES) {
+            return true;
+        }
+        const bool download = image.SafeToDownload();
+        if (download && image.info.IsTiled()) {
+            // Tiled images can't be downloaded yet, see GarbageCollectImages.
+            return false;
+        }
+        const auto image_id = slot_images.GetSlotId(image);
+        if (download) {
+            DownloadImageMemory(image_id);
+        }
+        freed_bytes += image.info.guest_size;
+        FreeImage(image_id);
+        return false;
+    });
+    if (freed_bytes == 0) {
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "Out of video memory, freed images covering {} MB",
+                freed_bytes >> 20);
+    // Images are destroyed once the GPU is done with them.
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    return true;
+}
+
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");

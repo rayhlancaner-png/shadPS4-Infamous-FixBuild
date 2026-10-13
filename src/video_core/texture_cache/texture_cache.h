@@ -280,6 +280,10 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// Frees images regardless of how recently they were used, to make room after an allocation
+    /// failed. Returns whether any memory was freed.
+    bool ReleaseMemoryUnderPressure();
+
     /// Calls func for every image starting at the address that ForEachImageInRegion would report
     /// for the region, in the same order. Such images are all listed in the page the address is
     /// in, so unlike ForEachImageInRegion this doesn't walk every page the region covers.
