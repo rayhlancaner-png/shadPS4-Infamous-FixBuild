@@ -404,6 +404,16 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].orientation = states[i].orientation;
         pData[i].touchData.touchNum =
             (states[i].touchpad[0].state ? 1 : 0) + (states[i].touchpad[1].state ? 1 : 0);
+        {
+            // Logged when the number of fingers the game is shown changes, to tell whether
+            // touches made on the emulated touchpad get as far as the game.
+            static int last_touch_num = 0;
+            if (pData[i].touchData.touchNum != last_touch_num) {
+                last_touch_num = pData[i].touchData.touchNum;
+                LOG_INFO(Lib_Pad, "touchpad fingers seen by the game: {} (x {} y {})",
+                         last_touch_num, states[i].touchpad[0].x, states[i].touchpad[0].y);
+            }
+        }
 
         if (!states[i].touchpad[0].state && states[i].touchpad[1].state) {
             pData[i].touchData.touch[0].x = states[i].touchpad[1].x;

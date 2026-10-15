@@ -815,6 +815,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/path_util.cpp
            src/common/perf_profiler.cpp
            src/common/perf_profiler.h
+           src/common/tuning.h
            src/common/path_util.h
            src/common/object_pool.h
            src/common/polyfill_thread.h

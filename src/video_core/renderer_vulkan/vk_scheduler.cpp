@@ -169,6 +169,15 @@ void Scheduler::CollectDispatchTimes() {
                     continue;
                 }
                 const u64 dispatch_ns = to_ns(*end - *start);
+                if (dispatch.is_draw) {
+                    auto& by_pixel_shader = draw_times[dispatch.program_hash];
+                    by_pixel_shader.draw_ns += dispatch_ns;
+                    by_pixel_shader.setup_ns += to_ns(*start - *begin);
+                    ++by_pixel_shader.count;
+                    by_pixel_shader.vertices += dispatch.groups;
+                    by_pixel_shader.vertex_hash = dispatch.vertex_hash;
+                    continue;
+                }
                 const size_t kind = dispatch.after_draws ? 1 : 0;
                 before_dispatch_ns[kind] += to_ns(*start - *begin);
                 auto& by_ring = dispatch_times_by_ring[dispatch.compute_ring ? 1 : 0];
@@ -246,11 +255,55 @@ void Scheduler::CollectDispatchTimes() {
              compute_rings.count, per_dispatch_us(compute_rings.dispatch_ns, compute_rings.count),
              graphics_ring.count, per_dispatch_us(graphics_ring.dispatch_ns, graphics_ring.count),
              static_cast<double>(total_ns) / 1'000'000.0, programs.size(), top);
+    ReportDrawTimes();
     dispatch_times.clear();
     dispatch_times_by_kind = {};
     dispatch_times_by_ring = {};
     before_dispatch_ns = {};
     timed_command_buffers = 0;
+}
+
+void Scheduler::ReportDrawTimes() {
+    // Draws are timed one by one like dispatches, so each waits for all work before it and its
+    // time is its own, a little more than it costs overlapped with other work. Which pixel
+    // shaders take the most is what this is for.
+    std::vector<std::pair<u64, DrawTimes>> programs(draw_times.begin(), draw_times.end());
+    draw_times.clear();
+    if (programs.empty()) {
+        return;
+    }
+    const size_t num_top = std::min<size_t>(10, programs.size());
+    std::partial_sort(
+        programs.begin(), programs.begin() + num_top, programs.end(),
+        [](const auto& a, const auto& b) { return a.second.draw_ns > b.second.draw_ns; });
+    u64 total_ns{};
+    u64 total_count{};
+    u64 setup_ns{};
+    for (const auto& [hash, times] : programs) {
+        total_ns += times.draw_ns;
+        total_count += times.count;
+        setup_ns += times.setup_ns;
+    }
+    std::string top;
+    for (size_t i = 0; i < num_top; ++i) {
+        const auto& [hash, times] = programs[i];
+        const double count = static_cast<double>(std::max<u64>(times.count, 1));
+        top += fmt::format("{}ps_{:#018x}+vs_{:#018x} {:.0f}% ({} of {:.1f} us, {:.0f} vertices)",
+                           i == 0 ? "" : ", ", hash, times.vertex_hash,
+                           total_ns == 0 ? 0.0
+                                         : static_cast<double>(times.draw_ns) * 100.0 /
+                                               static_cast<double>(total_ns),
+                           times.count, static_cast<double>(times.draw_ns) / 1000.0 / count,
+                           static_cast<double>(times.vertices) / count);
+    }
+    LOG_INFO(
+        Render_Vulkan,
+        "Draws timed one by one: {:.1f} ms in {} draws of {} pixel shaders, {:.1f} us "
+        "each, with {:.1f} us before each for the render pass and barriers; the most in {}",
+        static_cast<double>(total_ns) / 1'000'000.0, total_count, programs.size(),
+        static_cast<double>(total_ns) / 1000.0 / static_cast<double>(std::max<u64>(total_count, 1)),
+        static_cast<double>(setup_ns) / 1000.0 / static_cast<double>(std::max<u64>(total_count, 1)),
+        top);
 }
 
 void Scheduler::CountWorkRuns(u32 pair, u64 start, u64 end, bool first_run_compute,
@@ -558,7 +611,7 @@ void Scheduler::MarkWorkRun(bool compute) {
 }
 
 void Scheduler::MarkDispatch(DispatchMark mark, u64 program_hash, u32 groups, bool after_draws,
-                             bool compute_ring) {
+                             bool compute_ring, bool is_draw, u64 vertex_hash) {
     if (!sessions.back().time_dispatches) {
         return;
     }
@@ -572,6 +625,8 @@ void Scheduler::MarkDispatch(DispatchMark mark, u64 program_hash, u32 groups, bo
             .after_draws = after_draws,
             .compute_ring = compute_ring,
             .marks = 0,
+            .is_draw = is_draw,
+            .vertex_hash = vertex_hash,
         });
     } else if (timed_dispatches.empty() ||
                timed_dispatches.back().marks != static_cast<u32>(mark)) {

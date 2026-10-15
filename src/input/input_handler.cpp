@@ -3,8 +3,10 @@
 
 #include "input_handler.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <list>
 #include <map>
 #include <ranges>
@@ -227,6 +229,19 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
 }
 
 bool leftjoystick_halfmode = false, rightjoystick_halfmode = false;
+// Touchpad fingers driven by the sticks: the left stick works the left half of the pad and the
+// right stick the right half. The last stick values are kept so both axes set one position.
+bool touch_finger_mode[2] = {false, false};
+s16 touch_finger_stick[2][2] = {};
+constexpr float TouchFingerCenterX[2] = {0.25f, 0.75f};
+
+void MoveTouchFinger(GameController* controller, int finger, int component, s16 value) {
+    touch_finger_stick[finger][component] = value;
+    const float x = TouchFingerCenterX[finger] + touch_finger_stick[finger][0] / 128.0f * 0.23f;
+    const float y = 0.5f + touch_finger_stick[finger][1] / 128.0f * 0.4f;
+    controller->SetTouchpadState(finger, true, std::clamp(x, 0.0f, 1.0f),
+                                 std::clamp(y, 0.0f, 1.0f));
+}
 std::array<std::pair<int, int>, 4> leftjoystick_deadzone, rightjoystick_deadzone,
     lefttrigger_deadzone, righttrigger_deadzone;
 
@@ -754,6 +769,71 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+            if (new_button_state) {
+                LOG_INFO(Input, "touchpad swipe output fired");
+                controller->SwipeTouchpad(0.85f, 0.5f, 0.15f, 0.5f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.15f, 0.5f, 0.85f, 0.5f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.85f, 0.5f, 0.15f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.15f, 0.5f, 0.85f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_LEFT:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.85f, 0.5f, 0.15f, 0.5f, 2);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_RIGHT:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.15f, 0.5f, 0.85f, 0.5f, 2);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_UP:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.85f, 0.5f, 0.15f, 2);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_DOWN:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.15f, 0.5f, 0.85f, 2);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1:
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER2: {
+            const int finger = button == SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1 ? 0 : 1;
+            LOG_INFO(Input, "touchpad finger {} {}", finger + 1, new_button_state ? "down" : "up");
+            touch_finger_mode[finger] = new_button_state;
+            touch_finger_stick[finger][0] = touch_finger_stick[finger][1] = 0;
+            controller->SetTouchpadState(finger, new_button_state, TouchFingerCenterX[finger],
+                                         0.5f);
+            // The stick belongs to the finger while held, so the game sees it centred, and
+            // afterwards it has to report where it is again.
+            const auto x_axis = finger == 0 ? SDL_GAMEPAD_AXIS_LEFTX : SDL_GAMEPAD_AXIS_RIGHTX;
+            const auto y_axis = finger == 0 ? SDL_GAMEPAD_AXIS_LEFTY : SDL_GAMEPAD_AXIS_RIGHTY;
+            if (new_button_state) {
+                controller->Axis(GetAxisFromSDLAxis(x_axis), GetAxis(-0x80, 0x7f, 0));
+                controller->Axis(GetAxisFromSDLAxis(y_axis), GetAxis(-0x80, 0x7f, 0));
+            } else {
+                for (auto& out : output_arrays[gamepad_index].data) {
+                    if (out.axis == x_axis || out.axis == y_axis) {
+                        out.old_param = std::numeric_limits<s16>::min();
+                    }
+                }
+            }
+            break;
+        }
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;
             break;
@@ -857,11 +937,21 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case Axis::LeftX:
         case Axis::LeftY:
             ApplyDeadzone(new_param, leftjoystick_deadzone[gamepad_index]);
+            if (touch_finger_mode[0]) {
+                MoveTouchFinger(controller, 0, c_axis == Axis::LeftX ? 0 : 1, *new_param);
+                controller->Axis(c_axis, GetAxis(-0x80, 0x7f, 0));
+                return;
+            }
             multiplier = leftjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::RightX:
         case Axis::RightY:
             ApplyDeadzone(new_param, rightjoystick_deadzone[gamepad_index]);
+            if (touch_finger_mode[1]) {
+                MoveTouchFinger(controller, 1, c_axis == Axis::RightX ? 0 : 1, *new_param);
+                controller->Axis(c_axis, GetAxis(-0x80, 0x7f, 0));
+                return;
+            }
             multiplier = rightjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::TriggerLeft:

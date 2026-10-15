@@ -609,7 +609,13 @@ public:
     /// Marks a dispatch, given the program it runs, its workgroups if known and whether draws
     /// came before it.
     void MarkDispatch(DispatchMark mark, u64 program_hash = 0, u32 groups = 0,
-                      bool after_draws = false, bool compute_ring = false);
+                      bool after_draws = false, bool compute_ring = false, bool is_draw = false,
+                      u64 vertex_hash = 0);
+
+    /// Whether the command buffer being recorded is one whose dispatches and draws are timed.
+    bool TimingDispatches() const {
+        return !sessions.empty() && sessions.back().time_dispatches;
+    }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
@@ -673,6 +679,7 @@ private:
     /// Counts the dispatches timed one by one in a command buffer that is done, and logs where
     /// their time went every few seconds.
     void CollectDispatchTimes();
+    void ReportDrawTimes();
 
 private:
     const Instance& instance;
@@ -750,7 +757,7 @@ private:
     /// One command buffer in this many has its dispatches timed one by one. Their marks keep
     /// the GPU from overlapping them with other work, so few are.
     static constexpr u64 TimedDispatchInterval = 512;
-    static constexpr u32 MaxTimedDispatches = 1024;
+    static constexpr u32 MaxTimedDispatches = 4096;
     /// Three timestamps for each dispatch timed.
     vk::UniqueQueryPool dispatch_pool;
     struct TimedDispatch {
@@ -761,6 +768,10 @@ private:
         bool compute_ring;
         /// Which of its marks were written.
         u32 marks;
+        /// Whether it is a draw, run by its pixel shader (or its vertex shader if it has none,
+        /// as program_hash) and the vertex shader in vertex_hash, with its vertices as groups.
+        bool is_draw;
+        u64 vertex_hash;
     };
     /// The dispatches timed in the command buffer being recorded, and in the one submitted
     /// whose times aren't read yet, with its tick.
@@ -775,6 +786,16 @@ private:
     /// Since the last report: the time of the dispatches of each program, and of what came
     /// before dispatches after draws and after other dispatches.
     std::unordered_map<u64, DispatchTimes> dispatch_times;
+    struct DrawTimes {
+        u64 draw_ns;
+        u64 setup_ns;
+        u64 count;
+        u64 vertices;
+        u64 vertex_hash;
+    };
+    /// The same for draws, by pixel shader: the draws themselves and what came before them in
+    /// the command buffer, the render pass and barriers.
+    std::unordered_map<u64, DrawTimes> draw_times;
     std::array<DispatchTimes, 2> dispatch_times_by_kind{};
     std::array<u64, 2> before_dispatch_ns{};
     /// The same for the dispatches of the graphics ring and of the compute rings, barriers and

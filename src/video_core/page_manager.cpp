@@ -15,6 +15,7 @@
 #include "common/perf_profiler.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "common/tuning.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -563,8 +564,12 @@ struct SignalImpl : public PageManager::Impl {
     /// the one it faulted on, more of them the longer it keeps going, so it faults once a block.
     /// Pages it stops short of are only uploaded again, which costs less than the faults saved.
     static void InvalidateAhead(VAddr addr) {
-        static constexpr u32 MinRun = 2;
-        static constexpr u64 MaxPagesAhead = 16;
+        static const u32 MinRun = static_cast<u32>(Common::Tune("SHAD_AHEAD_MINRUN", 2));
+        static const u64 MaxPagesAhead = Common::Tune("SHAD_AHEAD_MAX", 16);
+        static const u64 FirstPagesAhead = Common::Tune("SHAD_AHEAD_BASE", 4);
+        if (MaxPagesAhead == 0) {
+            return;
+        }
         thread_local u64 last_page = 0;
         thread_local u32 run = 0;
         const u64 page = addr >> PageManager::PM_PAGE_BITS;
@@ -574,7 +579,7 @@ struct SignalImpl : public PageManager::Impl {
             return;
         }
         const u64 pages_ahead =
-            std::min<u64>(u64{4} << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
+            std::min<u64>(FirstPagesAhead << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
         rasterizer->InvalidateBuffersAhead((page + 1) << PageManager::PM_PAGE_BITS,
                                            pages_ahead << PageManager::PM_PAGE_BITS);
         // The next fault of the thread going on is on the page after them.

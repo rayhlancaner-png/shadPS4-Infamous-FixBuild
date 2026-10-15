@@ -290,6 +290,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     scheduler.SubmitIfWorkPiledUp(state);
     scheduler.CountWork();
 
+    if (scheduler.TimingDispatches()) {
+        // The draw is named by its pixel shader, or by its vertex shader if it has none.
+        const auto* vertex_info = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        const auto* pixel_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u64 vertex_hash = vertex_info ? vertex_info->pgm_hash : 0;
+        scheduler.MarkDispatch(
+            Scheduler::DispatchMark::Begin, pixel_info ? pixel_info->pgm_hash : vertex_hash,
+            regs.num_indices * regs.num_instances.NumInstances(), false, false, true, vertex_hash);
+    }
+
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
@@ -314,6 +324,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Start);
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -321,6 +332,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    scheduler.MarkDispatch(Scheduler::DispatchMark::End);
     DebugState.IncDrawCall();
     Common::Perf::Count(Common::Perf::Counter::Draws);
     if (std::exchange(last_work_compute, false)) {

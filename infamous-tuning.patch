@@ -1,0 +1,156 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-10-10 17:02:43.307859909 +0000
++++ b/CMakeLists.txt	2026-10-10 17:02:43.321374027 +0000
+@@ -815,6 +815,7 @@
+            src/common/path_util.cpp
+            src/common/perf_profiler.cpp
+            src/common/perf_profiler.h
++           src/common/tuning.h
+            src/common/path_util.h
+            src/common/object_pool.h
+            src/common/polyfill_thread.h
+diff -ruN a/src/common/tuning.h b/src/common/tuning.h
+--- a/src/common/tuning.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/common/tuning.h	2026-10-10 17:02:43.323481020 +0000
+@@ -0,0 +1,28 @@
++// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <cstdlib>
++#include "common/logging/log.h"
++#include "common/types.h"
++
++namespace Common {
++
++/// Value of an environment variable that overrides a performance constant, to try values without
++/// rebuilding. Returns default_value when it is unset or isn't a number. Logged once per call
++/// site, so call it from a function-local static.
++inline u64 Tune(const char* name, u64 default_value) {
++    u64 value = default_value;
++    if (const char* text = std::getenv(name)) {
++        char* end = nullptr;
++        const unsigned long long parsed = std::strtoull(text, &end, 10);
++        if (end != text && *end == '\0') {
++            value = parsed;
++        }
++    }
++    LOG_INFO(Render, "Tuning: {} = {}{}", name, value, value == default_value ? "" : " (override)");
++    return value;
++}
++
++} // namespace Common
+diff -ruN a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+--- a/src/video_core/buffer_cache/buffer_cache.cpp	2026-10-10 17:02:43.307733698 +0000
++++ b/src/video_core/buffer_cache/buffer_cache.cpp	2026-10-10 17:13:46.751127532 +0000
+@@ -2,12 +2,14 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <bit>
+ #include <magic_enum/magic_enum.hpp>
+ 
+ #include "common/alignment.h"
+ #include "common/perf_profiler.h"
+ #include "common/polyfill_thread.h"
+ #include "common/thread.h"
++#include "common/tuning.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
+ #include "core/memory.h"
+@@ -35,10 +37,17 @@
+ static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
+ // Memory game threads read back is copied back ahead of them for this long after they last
+ // faulted on it, for at most this many windows of it.
+-static constexpr auto HotWindowLife = std::chrono::seconds{5};
++static std::chrono::seconds HotWindowLife() {
++    static const auto life = std::chrono::seconds{Common::Tune("SHAD_HOT_WINDOW_SECS", 5)};
++    return life;
++}
+ static constexpr size_t MaxHotWindows = 64;
+ // A window whose copies ahead go stale is skipped for up to this many chances to copy it.
+-static constexpr u8 MaxPrefetchBackoff = 7;
++static u8 MaxPrefetchBackoff() {
++    static const u8 backoff =
++        static_cast<u8>(std::min<u64>(Common::Tune("SHAD_PREFETCH_BACKOFF_MAX", 7), 255));
++    return backoff;
++}
+ 
+ static constexpr auto ARENA_USAGE =
+     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+@@ -197,7 +206,8 @@
+ 
+     // GPU-modified ranges come as many small scattered islands,
+     // so the download is widened to a window around the request
+-    constexpr u64 WindowSize = 512_KB;
++    static const u64 WindowSize =
++        std::bit_floor(std::max<u64>(Common::Tune("SHAD_READBACK_WINDOW_KB", 512), 4) * 1_KB);
+     const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+     const VAddr window_start =
+         std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
+@@ -353,15 +363,17 @@
+ 
+ void BufferCache::PrefetchReadbacks() {
+     ApplyFinishedReadbacks();
+-    if (hot_windows.empty()) {
++    static const bool prefetch_off = Common::Tune("SHAD_PREFETCH_OFF", 0) != 0;
++    if (prefetch_off || hot_windows.empty()) {
+         return;
+     }
+     // The game is about to read results of the work it was just told is done. Copying the
+     // memory it read back recently now, behind that work, means it is mostly written back by
+     // the time the game touches it, so its threads neither fault on it nor wait for the GPU.
+     const auto now = std::chrono::steady_clock::now();
+-    std::erase_if(hot_windows,
+-                  [&](const HotWindow& window) { return now - window.last_fault > HotWindowLife; });
++    std::erase_if(hot_windows, [&](const HotWindow& window) {
++        return now - window.last_fault > HotWindowLife();
++    });
+     // Gathered once, as this runs on every fence and checked each window against every copy.
+     boost::container::small_vector<std::pair<VAddr, VAddr>, 32> in_flight_ranges;
+     for (const auto& readback : readbacks) {
+@@ -558,7 +570,7 @@
+     if (useful) {
+         hot->backoff = 0;
+     } else {
+-        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff);
++        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff());
+         hot->skip = hot->backoff;
+     }
+ }
+diff -ruN a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+--- a/src/video_core/page_manager.cpp	2026-10-10 17:02:43.307813827 +0000
++++ b/src/video_core/page_manager.cpp	2026-10-10 17:02:43.319615041 +0000
+@@ -15,6 +15,7 @@
+ #include "common/perf_profiler.h"
+ #include "common/signal_context.h"
+ #include "common/thread.h"
++#include "common/tuning.h"
+ #include "core/emulator_settings.h"
+ #include "core/memory.h"
+ #include "core/signals.h"
+@@ -563,8 +564,12 @@
+     /// the one it faulted on, more of them the longer it keeps going, so it faults once a block.
+     /// Pages it stops short of are only uploaded again, which costs less than the faults saved.
+     static void InvalidateAhead(VAddr addr) {
+-        static constexpr u32 MinRun = 2;
+-        static constexpr u64 MaxPagesAhead = 16;
++        static const u32 MinRun = static_cast<u32>(Common::Tune("SHAD_AHEAD_MINRUN", 2));
++        static const u64 MaxPagesAhead = Common::Tune("SHAD_AHEAD_MAX", 16);
++        static const u64 FirstPagesAhead = Common::Tune("SHAD_AHEAD_BASE", 4);
++        if (MaxPagesAhead == 0) {
++            return;
++        }
+         thread_local u64 last_page = 0;
+         thread_local u32 run = 0;
+         const u64 page = addr >> PageManager::PM_PAGE_BITS;
+@@ -574,7 +579,7 @@
+             return;
+         }
+         const u64 pages_ahead =
+-            std::min<u64>(u64{4} << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
++            std::min<u64>(FirstPagesAhead << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
+         rasterizer->InvalidateBuffersAhead((page + 1) << PageManager::PM_PAGE_BITS,
+                                            pages_ahead << PageManager::PM_PAGE_BITS);
+         // The next fault of the thread going on is on the page after them.

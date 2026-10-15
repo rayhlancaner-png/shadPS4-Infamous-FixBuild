@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include "common/serdes.h"
+#include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -272,6 +273,17 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                                        spv);
     if (spv.empty()) {
         return false;
+    }
+
+    // A patch in the shader patch folder replaces the shader the cache holds, as it does when the
+    // shader is compiled. Without this, patched shaders were only used while the cache was empty.
+    if (EmulatorSettings.IsPatchShaders()) {
+        if (auto patch =
+                GetShaderPatch(program->info.pgm_hash, program->info.hw_stage, perm_idx, "spv")) {
+            LOG_INFO(Loader, "Loaded patch for cached {} shader {:#x}", program->info.hw_stage,
+                     program->info.pgm_hash);
+            spv = std::move(*patch);
+        }
     }
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it

@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
 #include "common/perf_profiler.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/tuning.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -35,10 +37,17 @@ static constexpr u64 RESIDENCY_GRANULE_SIZE = 16_MB;
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
 // Memory game threads read back is copied back ahead of them for this long after they last
 // faulted on it, for at most this many windows of it.
-static constexpr auto HotWindowLife = std::chrono::seconds{5};
+static std::chrono::seconds HotWindowLife() {
+    static const auto life = std::chrono::seconds{Common::Tune("SHAD_HOT_WINDOW_SECS", 5)};
+    return life;
+}
 static constexpr size_t MaxHotWindows = 64;
 // A window whose copies ahead go stale is skipped for up to this many chances to copy it.
-static constexpr u8 MaxPrefetchBackoff = 7;
+static u8 MaxPrefetchBackoff() {
+    static const u8 backoff =
+        static_cast<u8>(std::min<u64>(Common::Tune("SHAD_PREFETCH_BACKOFF_MAX", 7), 255));
+    return backoff;
+}
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
@@ -198,7 +207,8 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 
     // GPU-modified ranges come as many small scattered islands,
     // so the download is widened to a window around the request
-    constexpr u64 WindowSize = 512_KB;
+    static const u64 WindowSize =
+        std::bit_floor(std::max<u64>(Common::Tune("SHAD_READBACK_WINDOW_KB", 512), 4) * 1_KB);
     const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
     const VAddr window_start =
         std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
@@ -354,15 +364,17 @@ std::shared_ptr<BufferCache::Readback> BufferCache::RecordReadback(const Buffer*
 
 void BufferCache::PrefetchReadbacks() {
     ApplyFinishedReadbacks();
-    if (hot_windows.empty()) {
+    static const bool prefetch_off = Common::Tune("SHAD_PREFETCH_OFF", 0) != 0;
+    if (prefetch_off || hot_windows.empty()) {
         return;
     }
     // The game is about to read results of the work it was just told is done. Copying the
     // memory it read back recently now, behind that work, means it is mostly written back by
     // the time the game touches it, so its threads neither fault on it nor wait for the GPU.
     const auto now = std::chrono::steady_clock::now();
-    std::erase_if(hot_windows,
-                  [&](const HotWindow& window) { return now - window.last_fault > HotWindowLife; });
+    std::erase_if(hot_windows, [&](const HotWindow& window) {
+        return now - window.last_fault > HotWindowLife();
+    });
     // Gathered once, as this runs on every fence and checked each window against every copy.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 32> in_flight_ranges;
     for (const auto& readback : readbacks) {
@@ -559,7 +571,7 @@ void BufferCache::RatePrefetch(Readback& readback, bool useful) {
     if (useful) {
         hot->backoff = 0;
     } else {
-        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff);
+        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff());
         hot->skip = hot->backoff;
     }
 }
@@ -948,47 +960,41 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 }
 
 std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
-    const auto try_allocate = [this](u64 allocation_size,
-                                     u32 type_index) -> std::optional<vk::DeviceMemory> {
+    const auto try_allocate = [this](u64 allocation_size) {
         const vk::MemoryAllocateInfo alloc_info = {
             .allocationSize = allocation_size,
             .memoryTypeIndex = type_index,
         };
-        vk::DeviceMemory memory{};
-        const auto result = instance.GetDevice().allocateMemory(&alloc_info, nullptr, &memory);
-        if (result == vk::Result::eSuccess) {
-            return memory;
-        }
-        ASSERT_MSG(result == vk::Result::eErrorOutOfDeviceMemory ||
-                       result == vk::Result::eErrorOutOfHostMemory,
-                   "Failed allocating residency memory with error {}", vk::to_string(result));
-        return std::nullopt;
+        return instance.GetDevice().allocateMemory(alloc_info);
     };
-    const auto allocate = [this, &try_allocate](u64 allocation_size) -> vk::DeviceMemory {
-        if (const auto memory = try_allocate(allocation_size, arena_memory_type_index)) {
-            return *memory;
-        }
-        // Textures the game no longer uses may be holding the memory, free them first.
-        if (texture_cache.ReleaseMemoryUnderPressure()) {
-            if (const auto memory = try_allocate(allocation_size, arena_memory_type_index)) {
-                return *memory;
+    // The device can run out of memory when the game makes gigabytes resident at once, which the
+    // texture collector, running once per submit, can't keep up with. Before giving up, free the
+    // textures nobody has used for a while, wait for the GPU so their memory is really released,
+    // and try again.
+    const auto log_memory = [&](const char* when, u64 allocation_size) {
+        const u64 usage = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
+        LOG_WARNING(Render,
+                    "Residency allocation of {} MB {}: device memory in use {} MB of budget {} MB, "
+                    "{} MB of it made resident for buffers",
+                    allocation_size >> 20, when, usage >> 20, instance.GetTotalMemoryBudget() >> 20,
+                    residency_allocated_bytes >> 20);
+    };
+    const auto allocate = [&](u64 allocation_size) {
+        auto result = try_allocate(allocation_size);
+        if (result.result == vk::Result::eErrorOutOfDeviceMemory) {
+            log_memory("failed", allocation_size);
+            texture_cache.ReleaseMemoryForAllocation();
+            scheduler.Finish();
+            // The images' memory is freed by operations that wait for the GPU, which is done now.
+            scheduler.PopPendingOperations();
+            result = try_allocate(allocation_size);
+            if (result.result != vk::Result::eSuccess) {
+                log_memory("failed again after freeing textures", allocation_size);
             }
         }
-        // Video memory is full. Past it the driver can't move this memory out, so it goes to
-        // the other memory types instead of ending the game.
-        LOG_WARNING(Render_Vulkan,
-                    "Allocating {} bytes of residency memory failed, trying other memory types",
-                    allocation_size);
-        const auto& properties = instance.GetMemoryProperties();
-        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
-            if (i == arena_memory_type_index || ((arena_memory_type_bits >> i) & 1) == 0) {
-                continue;
-            }
-            if (const auto memory = try_allocate(allocation_size, i)) {
-                return *memory;
-            }
-        }
-        UNREACHABLE_MSG("Out of memory allocating {} bytes of residency memory", allocation_size);
+        const auto memory = Vulkan::Check(std::move(result));
+        residency_allocated_bytes += allocation_size;
+        return memory;
     };
     // Ranges keep coming as the game streams data in. Carving them out of large chunks keeps the
     // driver from allocating memory each time, which is slow and limited to a few thousand
@@ -997,7 +1003,15 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
         return {allocate(size), 0};
     }
     if (!residency_chunk || residency_chunk_used + size > RESIDENCY_CHUNK_SIZE) {
-        residency_chunk = allocate(RESIDENCY_CHUNK_SIZE);
+        // A whole chunk may not fit when memory is short, while the range itself still does.
+        auto chunk = try_allocate(RESIDENCY_CHUNK_SIZE);
+        if (chunk.result == vk::Result::eErrorOutOfDeviceMemory) {
+            LOG_WARNING(Render, "No room for a {} MB residency chunk, allocating {} MB instead",
+                        RESIDENCY_CHUNK_SIZE >> 20, size >> 20);
+            return {allocate(size), 0};
+        }
+        residency_chunk = Vulkan::Check(std::move(chunk));
+        residency_allocated_bytes += RESIDENCY_CHUNK_SIZE;
         residency_chunk_used = 0;
     }
     const u64 offset = residency_chunk_used;
