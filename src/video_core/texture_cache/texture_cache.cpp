@@ -1127,10 +1127,11 @@ void TextureCache::RunGarbageCollector() {
     ++gc_tick;
 }
 
-bool TextureCache::ReleaseMemoryForAllocation() {
+bool TextureCache::ReleaseMemoryForAllocation(bool aggressive) {
     // Only images unused for as long as the collector's gentlest pass waits go, so the ones the
     // guest is still drawing with stay.
-    const u64 ticks_to_destroy = std::min<u64>(16, gc_tick);
+    // When that wasn't enough, anything not used in the last couple of submissions goes.
+    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 2 : 16, gc_tick);
     size_t num_freed = 0;
     image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, [&](Image& image) {
         const bool download = image.SafeToDownload();

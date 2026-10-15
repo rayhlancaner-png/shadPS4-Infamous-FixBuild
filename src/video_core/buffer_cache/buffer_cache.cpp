@@ -960,7 +960,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 }
 
 std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
-    const auto try_allocate = [this](u64 allocation_size) {
+    const auto try_allocate = [this](u64 allocation_size, u32 type_index) {
         const vk::MemoryAllocateInfo alloc_info = {
             .allocationSize = allocation_size,
             .memoryTypeIndex = type_index,
@@ -980,16 +980,34 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
                     residency_allocated_bytes >> 20);
     };
     const auto allocate = [&](u64 allocation_size) {
-        auto result = try_allocate(allocation_size);
+        auto result = try_allocate(allocation_size, arena_memory_type_index);
         if (result.result == vk::Result::eErrorOutOfDeviceMemory) {
             log_memory("failed", allocation_size);
-            texture_cache.ReleaseMemoryForAllocation();
-            scheduler.Finish();
-            // The images' memory is freed by operations that wait for the GPU, which is done now.
-            scheduler.PopPendingOperations();
-            result = try_allocate(allocation_size);
-            if (result.result != vk::Result::eSuccess) {
+            // First the textures nobody has used for a while, then the ones used lately too.
+            for (const bool aggressive : {false, true}) {
+                texture_cache.ReleaseMemoryForAllocation(aggressive);
+                scheduler.Finish();
+                // The images' memory is freed by operations that wait for the GPU, which is done
+                // now.
+                scheduler.PopPendingOperations();
+                result = try_allocate(allocation_size, arena_memory_type_index);
+                if (result.result != vk::Result::eErrorOutOfDeviceMemory) {
+                    break;
+                }
+            }
+            if (result.result == vk::Result::eErrorOutOfDeviceMemory) {
                 log_memory("failed again after freeing textures", allocation_size);
+                // Better slow in another memory type than ending the game.
+                const auto& properties = instance.GetMemoryProperties();
+                for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+                    if (i == arena_memory_type_index || ((arena_memory_type_bits >> i) & 1) == 0) {
+                        continue;
+                    }
+                    result = try_allocate(allocation_size, i);
+                    if (result.result != vk::Result::eErrorOutOfDeviceMemory) {
+                        break;
+                    }
+                }
             }
         }
         const auto memory = Vulkan::Check(std::move(result));
@@ -1004,7 +1022,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 size) {
     }
     if (!residency_chunk || residency_chunk_used + size > RESIDENCY_CHUNK_SIZE) {
         // A whole chunk may not fit when memory is short, while the range itself still does.
-        auto chunk = try_allocate(RESIDENCY_CHUNK_SIZE);
+        auto chunk = try_allocate(RESIDENCY_CHUNK_SIZE, arena_memory_type_index);
         if (chunk.result == vk::Result::eErrorOutOfDeviceMemory) {
             LOG_WARNING(Render, "No room for a {} MB residency chunk, allocating {} MB instead",
                         RESIDENCY_CHUNK_SIZE >> 20, size >> 20);
