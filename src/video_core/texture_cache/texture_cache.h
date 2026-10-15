@@ -287,7 +287,7 @@ public:
     /// Frees the images that have not been used for a while, without the collector's limits on how
     /// many go, for an allocation that failed for lack of device memory. GPU thread. Returns
     /// whether any image was freed. The memory is released once the GPU is done with the images.
-    bool ReleaseMemoryForAllocation();
+    bool ReleaseMemoryForAllocation(bool aggressive = false);
 
     /// Calls func for every image starting at the address that ForEachImageInRegion would report
     /// for the region, in the same order. Such images are all listed in the page the address is
